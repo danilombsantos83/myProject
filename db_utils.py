@@ -178,10 +178,37 @@ def importar_candles_binance(db_path, symbol, interval, start_str=None, limit=10
     return inserted
 
 
+def gerenciar_rotatividade_backups(conn, table_name_base):
+    """
+    Mantém apenas os 3 backups mais recentes de uma tabela específica.
+    Remove os backups mais antigos automaticamente.
+    """
+    cursor = conn.cursor()
+    # Padrão de nome: candles_btc_1h_backup_YYYYMMDD_HHMMSS
+    pattern = f"{table_name_base}_backup_%"
+    
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE ?", (pattern,))
+    backups = [row[0] for row in cursor.fetchall()]
+    
+    # Ordenar decrescente (o timestamp no nome garante que os mais recentes fiquem primeiro)
+    backups.sort(reverse=True)
+    
+    # Se houver mais que 3, apaga os excedentes (do índice 3 em diante)
+    if len(backups) > 3:
+        excedentes = backups[3:]
+        for table_to_drop in excedentes:
+            try:
+                cursor.execute(f"DROP TABLE {table_to_drop}")
+                print(f"♻️  Rotatividade: Backup antigo removido: {table_to_drop}")
+            except Exception as e:
+                print(f"⚠️ Erro ao remover backup antigo {table_to_drop}: {e}")
+        conn.commit()
+
+
 def atualizar_banco(db_path, symbol=None):
     """
     Atualiza TODOS os intervalos configurados para um par (ou seleciona um).
-    Realiza backup antes de atualizar.
+    Realiza backup antes de atualizar e aplica rotatividade (Mantém 3 últimos).
     """
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
@@ -201,11 +228,10 @@ def atualizar_banco(db_path, symbol=None):
         for interval_key, interval in interval_map.items():
             table_name = f"candles_{sym.lower()}_{interval_key}"
             
-            # --- Lógica de Backup (Corrigida) ---
+            # --- Lógica de Backup com Rotatividade ---
             conn = sqlite3.connect(db_path)
             cursor = conn.cursor()
             
-            # Verifica se a tabela existe de verdade antes de tentar contar ou fazer backup
             cursor.execute(f"SELECT name FROM sqlite_master WHERE type='table' AND name='{table_name}'")
             existe = cursor.fetchone()
 
@@ -219,12 +245,14 @@ def atualizar_banco(db_path, symbol=None):
                     print(f"\n🗂️ Backup: {table_name} → {backup_table}")
                     cursor.execute(f"CREATE TABLE {backup_table} AS SELECT * FROM {table_name}")
                     conn.commit()
+                    
+                    # Chama a função de limpeza automática
+                    gerenciar_rotatividade_backups(conn, table_name)
             
             conn.close()
             # ------------------------------------------------
 
             # Chama a função unificada de importação
-            # Ela criará a tabela completa se não existir
             inseridos = importar_candles_binance(db_path, sym, interval)
             
             if inseridos > 0:

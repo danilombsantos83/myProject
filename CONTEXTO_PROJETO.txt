@@ -1,0 +1,2043 @@
+﻿
+==============================================================================
+NOME DO ARQUIVO: analise.py
+==============================================================================
+
+import pandas as pd
+from backtest import backtest_bollinger
+from graficos import gerar_grafico_csv
+from db_utils import listar_pares_disponiveis, listar_intervalos_disponiveis, carregar_candles
+from relatorio_ia import gerar_relatorio_performance
+from datetime import datetime, timedelta
+import config
+import os
+import sqlite3
+
+# === Pergunta/Atualiza configuração de bandas Bollinger ===
+def definir_bollinger_distancia(db_path):
+    valor_atual = config.obter_bollinger_distancia(db_path)
+    print(f"\n⚙️  Distância atual das bordas de Bollinger: {valor_atual}%")
+    alterar = input("Deseja alterar este valor? (S/N): ").strip().lower()
+
+    if alterar == "s":
+        try:
+            novo_valor = float(input("Informe a nova distância percentual (ex: 0.5 para 0,5%): ").strip())
+            config.atualizar_bollinger_distancia(db_path, novo_valor)
+            print(f"✅ Novo valor salvo: {novo_valor}%")
+            return novo_valor
+        except ValueError:
+            print("❌ Valor inválido. Mantendo valor anterior.")
+            return valor_atual
+    else:
+        return valor_atual
+
+
+# === Pergunta/Atualiza configuração de Stop Loss ===
+def definir_stop_loss(db_path):
+    valor_atual = config.obter_stop_loss(db_path)
+    print(f"🛑 Stop Loss atual: {valor_atual}%")
+    alterar = input("Deseja alterar este valor? (S/N): ").strip().lower()
+
+    if alterar == "s":
+        try:
+            novo_valor = float(input("Informe o novo Stop Loss percentual (ex: 2.0 para 2%): ").strip())
+            config.atualizar_stop_loss(db_path, novo_valor)
+            print(f"✅ Novo Stop Loss salvo: {novo_valor}%")
+            return novo_valor
+        except ValueError:
+            print("❌ Valor inválido. Mantendo valor anterior.")
+            return valor_atual
+    else:
+        return valor_atual
+
+
+# === Pergunta/Atualiza configuração de Taxa de Corretagem ===
+def definir_taxa_corretagem(db_path):
+    valor_atual = config.obter_taxa_corretagem(db_path)
+    print(f"💸 Taxa de Corretagem atual (por ordem): {valor_atual}%")
+    alterar = input("Deseja alterar este valor? (S/N): ").strip().lower()
+
+    if alterar == "s":
+        try:
+            novo_valor = float(input("Informe a nova taxa percentual (ex: 0.1 para Binance Padrao): ").strip())
+            config.atualizar_taxa_corretagem(db_path, novo_valor)
+            print(f"✅ Nova Taxa salva: {novo_valor}%")
+            return novo_valor
+        except ValueError:
+            print("❌ Valor inválido. Mantendo valor anterior.")
+            return valor_atual
+    else:
+        return valor_atual
+
+
+# === Pergunta sobre Filtro de Tendência ===
+def definir_filtro_tendencia():
+    print(f"\n📈 Filtro de Tendência (EMA)")
+    print("Deseja ativar o filtro de tendência para esta análise?")
+    print("Isso impedirá compras se o preço estiver abaixo da Média Móvel.")
+    escolha = input("Digite 'S' para ativar ou ENTER para pular: ").strip().lower()
+    
+    if escolha == 's':
+        periodo_str = input("Informe o período da EMA (Padrão 200): ").strip()
+        if periodo_str.isdigit():
+            return int(periodo_str)
+        else:
+            print("ℹ️ Usando padrão EMA 200.")
+            return 200
+    return None
+
+
+# === Execução da análise ===
+def executar_analise(caminho_db):
+    try:
+        # === Seleção do par ===
+        pares = listar_pares_disponiveis(caminho_db)
+        if not pares:
+            print("⚠️ Nenhum par disponível no banco. Importe candles primeiro.")
+            return
+
+        print("\n📊 Pares disponíveis no banco:")
+        for i, par in enumerate(pares, start=1):
+            print(f"{i} - {par}")
+        print("0 - Retornar ao menu")
+
+        while True:
+            escolha_par = input("Escolha o par: ").strip()
+            if escolha_par == "0":
+                return
+            elif escolha_par.isdigit() and 1 <= int(escolha_par) <= len(pares):
+                simbolo = pares[int(escolha_par) - 1]
+                break
+            else:
+                print("❌ Opção inválida.")
+
+        # === Seleção do intervalo ===
+        intervalos = listar_intervalos_disponiveis(caminho_db, simbolo)
+        if not intervalos:
+            print("⚠️ Nenhum intervalo disponível para este par.")
+            return
+
+        print(f"\n⏱ Intervalos disponíveis para {simbolo}:")
+        for i, inter in enumerate(intervalos, start=1):
+            print(f"{i} - {inter}")
+        print("0 - Retornar ao menu")
+
+        while True:
+            escolha_inter = input("Escolha o intervalo: ").strip()
+            if escolha_inter == "0":
+                return
+            elif escolha_inter.isdigit() and 1 <= int(escolha_inter) <= len(intervalos):
+                intervalo = intervalos[int(escolha_inter) - 1]
+                break
+            else:
+                print("❌ Opção inválida.")
+
+        # === Configurações da Estratégia ===
+        distancia_bollinger = definir_bollinger_distancia(caminho_db)
+        stop_loss_perc = definir_stop_loss(caminho_db)
+        taxa_corretagem = definir_taxa_corretagem(caminho_db)
+        
+        # === Configuração da Estratégia Dinâmica ===
+        print("\n🧠 --- ESTRATÉGIA DINÂMICA ---")
+        
+        # Input Lucro Mínimo (Filtro de Volatilidade)
+        lucro_minimo = 0.0
+        resp_lucro = input("Definir LUCRO MÍNIMO ESTIMADO por trade (ex: 0.5%) ou Enter p/ 0: ").strip()
+        if resp_lucro:
+            try:
+                lucro_minimo = float(resp_lucro)
+                print(f"ℹ️ Filtro ativo: Só entra se potencial > {lucro_minimo}% + taxas.")
+            except:
+                print("❌ Valor inválido. Usando 0.0%.")
+        
+        # --- ESTRATÉGIA ADAPTATIVA (RSI) ---
+        print("\n🤖 [NOVO] Estratégia Adaptativa (RSI)")
+        print("Se ativada, o robô decide automaticamente:")
+        print(" - Nota < 20: Não entra (Hard Floor).")
+        print(" - Nota 20 a 60: Sai na Banda Superior (Scalp).")
+        print(" - Nota > 60: Ativa Trailing Stop e ignora Banda Superior (Surf).")
+        
+        usar_adaptativo = input("Ativar Estratégia Adaptativa? [S/N]: ").strip().upper() == "S"
+        
+        nota_minima = 0
+        usar_trailing = False
+        mover_alvo = False
+        sair_banda = True
+        
+        if usar_adaptativo:
+            print("✅ Estratégia Adaptativa ATIVADA. Parâmetros de saída serão automáticos.")
+        else:
+            # Configuração Manual Antiga
+            resp_nota = input("Definir NOTA MÍNIMA de Tendência (0-100) para entrar (Ex: 30 para evitar Quedas): ").strip()
+            if resp_nota.isdigit():
+                nota_minima = int(resp_nota)
+                print(f"🛡️ Filtro de Qualidade Ativo: Só compra se Nota >= {nota_minima}")
+            
+            usar_trailing = input("Usa Trailing Stop (Stop Móvel)? [S/N]: ").strip().upper() == "S"
+            
+            if usar_trailing:
+                print("ℹ️ Com Trailing Stop ativo, você pode escolher como será a SAÍDA DE LUCRO:")
+                print("1 - Sair na Banda Superior Fixa (Alvo Fixo)")
+                print("2 - Sair na Banda Superior mas mover o alvo se preço subir (Alvo Móvel)")
+                print("3 - Ignorar Banda e sair apenas pelo Stop Móvel (Trend Following)")
+                
+                tipo_saida = input("Escolha (1/2/3): ").strip()
+                
+                if tipo_saida == "3":
+                    sair_banda = False
+                    print("🚀 Modo TREND FOLLOWING ativado! Saída apenas pelo Stop Móvel.")
+                elif tipo_saida == "2":
+                    mover_alvo = True
+                    print("🏃 Modo ALVO MÓVEL ativado! O alvo subirá junto com o preço.")
+                else:
+                    print("🎯 Modo ALVO FIXO padrão.")
+        
+        # Configuração Temporária (não salva no banco)
+        periodo_ema = definir_filtro_tendencia()
+
+        # === Seleção do período ===
+        print(f"\n📅 Defina o intervalo de datas para análise ({simbolo} - {intervalo})")
+        print("Formato: YYYY-MM-DD HH:MM:SS (exemplo: 2025-01-01 00:00:00)")
+
+        while True:
+            data_inicio_str = input("Data inicial (YYYY-MM-DD HH:MM:SS) ou 'R' para retornar: ").strip()
+            if data_inicio_str.upper() == "R":
+                return
+            try:
+                data_inicio_dt = datetime.strptime(data_inicio_str, "%Y-%m-%d %H:%M:%S")
+                break
+            except ValueError:
+                print("❌ Formato inválido. Use: YYYY-MM-DD HH:MM:SS")
+
+        # --- BUSCA A ÚLTIMA DATA DISPONÍVEL NO BANCO ---
+        default_final_dt = data_inicio_dt + timedelta(hours=24) 
+        try:
+            conn_temp = sqlite3.connect(caminho_db)
+            cursor_temp = conn_temp.cursor()
+            tabela_alvo = f"candles_{simbolo.lower()}_{intervalo}"
+            cursor_temp.execute(f"SELECT MAX(timestamp) FROM {tabela_alvo}")
+            max_ts = cursor_temp.fetchone()[0]
+            conn_temp.close()
+
+            if max_ts:
+                default_final_dt = datetime.fromtimestamp(max_ts / 1000)
+        except Exception as e:
+            pass
+
+        data_final_str = input(f"Data final (ENTER = Máximo disponível → {default_final_dt.strftime('%Y-%m-%d %H:%M:%S')}): ").strip()
+        
+        if data_final_str == "":
+            data_final_dt = default_final_dt
+        else:
+            try:
+                data_final_dt = datetime.strptime(data_final_str, "%Y-%m-%d %H:%M:%S")
+                if data_final_dt <= data_inicio_dt:
+                    print("⚠️ A data final deve ser posterior à data inicial. Operação cancelada.")
+                    return
+            except ValueError:
+                print("❌ Formato inválido para data final. Operação cancelada.")
+                return
+
+        data_inicio = data_inicio_dt.strftime("%Y-%m-%d %H:%M:%S")
+        data_fim = data_final_dt.strftime("%Y-%m-%d %H:%M:%S")
+
+        # === Carregar candles ===
+        df = carregar_candles(caminho_db, simbolo, intervalo, data_inicio, data_fim)
+        if df.empty:
+            print("⚠️ Nenhum dado encontrado para o período.")
+            return
+
+        # === Salva na RAIZ (.) ===
+        arquivo_csv_operacoes = f"operacoes_{simbolo}_{intervalo}.csv"
+        saldo_inicial = 1000.0
+
+        # === Backtest Bollinger com registro em CSV ===
+        df, operacoes = backtest_bollinger(
+            df, 
+            distancia_bollinger, 
+            stop_loss_perc=stop_loss_perc,
+            taxa_corretagem=taxa_corretagem,
+            periodo_ema=periodo_ema,
+            saldo_inicial=saldo_inicial, 
+            arquivo_operacoes=arquivo_csv_operacoes,
+            usar_trailing_stop=usar_trailing,
+            sair_na_banda_superior=sair_banda,
+            mover_alvo_com_preco=mover_alvo,
+            lucro_minimo_perc=lucro_minimo,
+            nota_minima=nota_minima,
+            estrategia_adaptativa=usar_adaptativo # Passando a nova flag
+        )
+
+        # === Gerar gráfico CSV ===
+        gerar_grafico_csv(df, simbolo, intervalo, df['timestamp'].min(), df['timestamp'].max())
+        
+        # === EXIBIR RELATÓRIO E SALVAR NO ARQUIVO LOG ===
+        if not operacoes:
+            print("⚠️ Nenhuma operação realizada com estes parâmetros.")
+        else:
+            fechamentos = [op for op in operacoes if op[1] in ["VENDA", "STOP LOSS", "TRAILING STOP"]]
+            
+            total_ops_fechadas = len(fechamentos)
+            wins = len([op for op in fechamentos if op[3] > 0])
+            loss = len([op for op in fechamentos if op[3] <= 0])
+            
+            win_rate = (wins / total_ops_fechadas * 100) if total_ops_fechadas > 0 else 0.0
+            
+            saldo_final = operacoes[-1][4]
+            lucro_total = saldo_final - 1000.0
+            perc_lucro = (lucro_total / 1000.0) * 100
+
+            timestamp_teste = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            log_completo = f"\n=== REGISTRO DE TESTE: {timestamp_teste} ===\n"
+            log_completo += "█" * 50 + "\n"
+            
+            # --- SEÇÃO DE PARÂMETROS ---
+            log_completo += "⚙️  PARÂMETROS UTILIZADOS:\n"
+            log_completo += f"   - Par: {simbolo} | Intervalo: {intervalo}\n"
+            log_completo += f"   - Período Analisado: {data_inicio} até {data_fim}\n"
+            log_completo += f"   - Distância Bollinger: {distancia_bollinger}%\n"
+            log_completo += f"   - Stop Loss Inicial: {stop_loss_perc}%\n"
+            log_completo += f"   - Taxa Corretagem: {taxa_corretagem}%\n"
+            log_completo += f"   - Filtro EMA: {'DESATIVADO' if not periodo_ema else f'ATIVO (Período {periodo_ema})'}\n"
+            log_completo += f"   - Lucro Mínimo Exigido: {lucro_minimo}%\n"
+            log_completo += f"   - Estratégia Adaptativa (RSI): {'ATIVADA' if usar_adaptativo else 'OFF'}\n"
+            
+            if not usar_adaptativo:
+                log_completo += f"   - Nota Mínima (RSI): {nota_minima}\n"
+                tipo_desc = "ALVO FIXO (Padrão)"
+                if not sair_banda: tipo_desc = "TREND FOLLOWING (Sem Alvo)"
+                elif mover_alvo: tipo_desc = "ALVO MÓVEL (Persegue Preço)"
+                log_completo += f"   - Modo de Saída: {tipo_desc}\n"
+                log_completo += f"   - Trailing Stop: {'ATIVO' if usar_trailing else 'DESATIVADO'}\n"
+            else:
+                log_completo += "   - Modos de Saída: Automático (Híbrido)\n"
+                
+            log_completo += "-" * 50 + "\n"
+            # ---------------------------
+
+            log_completo += f"📊 RELATÓRIO DE PERFORMANCE: {simbolo} ({intervalo})\n"
+            log_completo += f"========================================\n"
+            log_completo += f"💰 Saldo Inicial:    $ 1000.00\n"
+            log_completo += f"💰 Saldo Final:      $ {saldo_final:.2f}\n"
+            log_completo += f"📈 Lucro Líquido:    $ {lucro_total:.2f} ({perc_lucro:.2f}%)\n"
+            log_completo += f"----------------------------------------\n"
+            log_completo += f"🎲 Total Trades:     {total_ops_fechadas}\n"
+            log_completo += f"✅ Acertos (Wins):   {wins} ({win_rate:.1f}%)\n"
+            log_completo += f"❌ Erros (Losses):   {loss}\n"
+            
+            lucro_bruto = sum([op[3] for op in fechamentos if op[3] > 0])
+            prejuizo_bruto = abs(sum([op[3] for op in fechamentos if op[3] < 0]))
+            profit_factor = (lucro_bruto / prejuizo_bruto) if prejuizo_bruto > 0 else 0
+            log_completo += f"⚖️ Profit Factor:     {profit_factor:.2f}\n"
+            
+            log_completo += f"========================================\n"
+            log_completo += f"📄 Log detalhado salvo em: {arquivo_csv_operacoes}\n"
+            
+            log_completo += "\n📝 TODAS AS OPERAÇÕES REALIZADAS:\n"
+            colunas = ["Data", "Ação", "Preço", "Lucro", "Saldo", "Nota", "Status"]
+            df_ops = pd.DataFrame(operacoes, columns=colunas)
+            
+            # Exibir tudo
+            log_completo += df_ops.to_string(index=False) + "\n"
+            
+            log_completo += "█" * 50 + "\n"
+
+            print(log_completo)
+
+            try:
+                diretorio_atual = os.getcwd()
+                caminho_log_geral = os.path.join(diretorio_atual, "outputTestes.log")
+                print(f"📂 Tentando salvar log geral em: {caminho_log_geral}")
+                with open(caminho_log_geral, "a", encoding="utf-8") as f:
+                    f.write(log_completo + "\n")
+                print(f"✅ Resultado salvo com sucesso em: {caminho_log_geral}")
+            except Exception as e:
+                print(f"⚠️ Erro ao salvar arquivo de log geral: {e}")
+
+        print("\n✅ Análise concluída com sucesso!")
+
+    except Exception as e:
+        print("❌ Erro na análise técnica:", e)
+
+==============================================================================
+NOME DO ARQUIVO: atualizar_candles.py
+==============================================================================
+
+from datetime import datetime
+from config import interval_map
+from db_utils import listar_pares_disponiveis, importar_candles_binance
+import sqlite3
+
+def alimentar_sqlite_com_candles(db_path):
+    """
+    Interface para importação manual de candles da Binance.
+    Coleta parâmetros do usuário e chama db_utils.importar_candles_binance.
+    """
+    print("\n📥 Importação Manual de Candles Históricos")
+
+    # Detecta símbolos existentes usando a função centralizada (nome corrigido)
+    symbols = listar_pares_disponiveis(db_path)
+
+    if not symbols:
+        print("⚠️ Nenhuma tabela de candles existente no banco.")
+        symbol = input("Digite o par de moedas para iniciar (ex: BTCUSDT): ").strip().upper()
+        if not symbol:
+            print("❌ Nenhum par informado. Operação cancelada.")
+            return
+        symbols = [symbol]
+    else:
+        print("💱 Símbolos disponíveis no banco:")
+        for s in symbols:
+            print(f" - {s}")
+
+        opcao = input("\nDeseja adicionar novo par? (s/n): ").strip().lower()
+        if opcao == "s":
+            novo_symbol = input("Digite o novo par (ex: ADAUSDT): ").strip().upper()
+            if novo_symbol:
+                symbols.append(novo_symbol)
+            else:
+                print("❌ Par inválido. Nenhum adicionado.")
+
+    # Escolha de intervalo
+    print("\n⏱️ Intervalos disponíveis:")
+    for k in interval_map:
+        print(f" - {k}")
+    user_choice = input("Digite o intervalo desejado (ex: 1m, 5m, 1h): ").lower()
+
+    if user_choice not in interval_map:
+        print("❌ Intervalo inválido.")
+        return
+
+    interval = interval_map[user_choice]
+
+    # Data inicial
+    print("📅 Digite a data inicial para a importação.")
+    start_str = input("Formato YYYY-MM-DD HH:MM:SS (ex: 2024-01-01 00:00:00): ").strip()
+    
+    try:
+        datetime.strptime(start_str, "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        print("❌ Data inválida. Use o formato YYYY-MM-DD HH:MM:SS.")
+        return
+
+    # Atualiza cada símbolo da lista
+    symbol_to_update = None
+    if len(symbols) > 1:
+        target = input(f"Digite o par para atualizar ou ENTER para TODOS ({', '.join(symbols)}): ").strip().upper()
+        if target:
+            if target in symbols:
+                symbols = [target]
+            else:
+                # Se for um novo par que não estava na lista, adiciona
+                symbols = [target]
+    
+    for symbol in symbols:
+        print(f"\n📡 Iniciando importação para {symbol} em {user_choice}...")
+        
+        qtd = importar_candles_binance(db_path, symbol, interval, start_str=start_str)
+        
+        print(f"✅ {symbol}: {qtd} candles inseridos.")
+
+    print("\n🏁 Importação manual concluída!")
+
+==============================================================================
+NOME DO ARQUIVO: backtest.py
+==============================================================================
+
+from indicadores import calcular_bollinger, enriquecer_dados_analise, adicionar_ema_tendencia
+import pandas as pd
+import os
+
+def backtest_bollinger(df, distancia_bollinger=0.5, stop_loss_perc=None, taxa_corretagem=0.0, periodo_ema=None, saldo_inicial=1000.0, arquivo_operacoes=None, usar_trailing_stop=False, sair_na_banda_superior=True, mover_alvo_com_preco=False, lucro_minimo_perc=0.0, nota_minima=0, estrategia_adaptativa=False):
+    """
+    Realiza backtest de Bollinger.
+    Se estrategia_adaptativa=True, ignora os parametros fixos de saida e decide baseado no RSI.
+    """
+    # === Preparação dos Dados ===
+    df = calcular_bollinger(df)
+    
+    # Se houver filtro de tendência configurado para esta execução
+    col_ema = None
+    if periodo_ema:
+        df = adicionar_ema_tendencia(df, periodo_ema)
+        col_ema = f'ema_{periodo_ema}'
+        
+    # Aqui os dados ganham RSI, Nota e Status de Tendência
+    df = enriquecer_dados_analise(df)
+    
+    operacoes = []
+    logs_para_csv = []
+    
+    posicao = None
+    preco_entrada = 0
+    preco_stop = 0
+    preco_alvo_dinamico = 0 
+    maximo_atingido = 0     
+    
+    saldo = saldo_inicial
+    quantidade_ativos = 0.0
+    
+    margem = distancia_bollinger / 100
+    fator_stop = 1 - (stop_loss_perc / 100) if stop_loss_perc else 0
+    taxa_multiplier = taxa_corretagem / 100 
+
+    # Variáveis de controle de estado da estratégia (para quando já estiver comprado)
+    modo_saida_atual = "PADRAO" # Apenas para log
+
+    # === Loop Único de Execução ===
+    for i in range(1, len(df)):
+        candle = df.iloc[i]
+        preco = candle["close"]
+        timestamp = candle["timestamp"]
+        
+        # Captura dados de tendência
+        nota_tendencia = candle.get("nota_tendencia", 50)
+        status_tendencia = candle.get("status_tendencia", "Indefinido")
+        
+        # === DEFINIÇÃO DINÂMICA DE COMPORTAMENTO ===
+        if estrategia_adaptativa:
+            # 1. Filtro de Segurança (Hard Floor)
+            # Se adaptativo, nunca compra abaixo de 20 (Franca Queda) - AJUSTADO PARA 20
+            filtro_adaptativo_ok = (nota_tendencia >= 20)
+            
+            # 2. Definição de Saída baseada na força atual
+            if nota_tendencia > 60:
+                # Tendência Forte: Tenta alongar o trade
+                usar_trailing_agora = True
+                sair_banda_agora = False # Ignora o teto da banda para deixar subir
+                modo_log = "TREND"
+            else:
+                # Mercado Lateral ou Fraco: Garante o lucro na banda
+                usar_trailing_agora = False
+                sair_banda_agora = True
+                modo_log = "SCALP"
+        else:
+            # Usa os parâmetros fixos escolhidos pelo usuário
+            filtro_adaptativo_ok = True
+            usar_trailing_agora = usar_trailing_stop
+            sair_banda_agora = sair_na_banda_superior
+            modo_log = "FIXO"
+
+        acao = "N/A"
+        lucro_operacao = 0
+        
+        # --- ATUALIZAÇÃO DINÂMICA (Se comprado) ---
+        if posicao == "COMPRA":
+            # 1. Trailing Stop (Se ativo neste momento)
+            if stop_loss_perc and usar_trailing_agora:
+                novo_stop_calculado = preco * fator_stop
+                if novo_stop_calculado > preco_stop:
+                    preco_stop = novo_stop_calculado
+            
+            # 2. Alvo Móvel
+            if mover_alvo_com_preco and sair_banda_agora:
+                if preco > maximo_atingido:
+                    diferenca = preco - maximo_atingido
+                    preco_alvo_dinamico += diferenca 
+                    maximo_atingido = preco           
+
+        # --- VERIFICAÇÃO DE SAÍDA PELO STOP ---
+        if posicao == "COMPRA" and stop_loss_perc:
+            if preco <= preco_stop:
+                valor_bruto = quantidade_ativos * preco
+                custo_taxa = valor_bruto * taxa_multiplier
+                valor_liquido = valor_bruto - custo_taxa
+                
+                lucro_operacao = valor_liquido - (quantidade_ativos * preco_entrada) 
+                saldo = valor_liquido
+                
+                posicao = None
+                acao = "STOP LOSS" if lucro_operacao < 0 else "TRAILING STOP" 
+                
+                operacoes.append((timestamp, acao, preco, lucro_operacao, saldo, nota_tendencia, status_tendencia))
+                
+                if arquivo_operacoes:
+                    logs_para_csv.append({
+                        "timestamp": timestamp, "acao": acao, "preco": preco, 
+                        "lucro": lucro_operacao, "saldo": saldo, 
+                        "volume_compra": candle["volume_compra"], "volume_venda": candle["volume_venda"],
+                        "nota_tendencia": nota_tendencia, "status_tendencia": status_tendencia
+                    })
+                continue 
+
+        # --- Lógica de COMPRA ---
+        if posicao is None and preco <= candle["BB_down"] * (1 + margem):
+            
+            tendencia_ok = True
+            
+            # Filtros Fixos
+            if col_ema and preco <= candle[col_ema]:
+                tendencia_ok = False
+            
+            if nota_tendencia < nota_minima:
+                tendencia_ok = False
+                
+            # Filtro Adaptativo
+            if estrategia_adaptativa and not filtro_adaptativo_ok:
+                tendencia_ok = False
+            
+            # Cálculos de Potencial
+            alvo_estimado = candle["BB_up"] * (1 - margem)
+            lucro_bruto_potencial_valor = alvo_estimado - preco
+            custo_total_est = (preco * taxa_multiplier) + (alvo_estimado * taxa_multiplier)
+            margem_lucro_exigida = preco * (lucro_minimo_perc / 100.0)
+            
+            valida_lucro = lucro_bruto_potencial_valor > (custo_total_est + margem_lucro_exigida)
+
+            if tendencia_ok and valida_lucro:
+                custo_taxa = saldo * taxa_multiplier
+                valor_para_investir = saldo - custo_taxa
+                quantidade_ativos = valor_para_investir / preco
+                
+                posicao = "COMPRA"
+                preco_entrada = preco
+                maximo_atingido = preco 
+                
+                if stop_loss_perc:
+                    preco_stop = preco_entrada * fator_stop
+                
+                preco_alvo_dinamico = alvo_estimado
+
+                acao = "COMPRA"
+                operacoes.append((timestamp, "COMPRA", preco, 0, valor_para_investir, nota_tendencia, status_tendencia))
+                
+                if arquivo_operacoes:
+                    logs_para_csv.append({
+                        "timestamp": timestamp, "acao": acao, "preco": preco, 
+                        "lucro": 0, "saldo": valor_para_investir, 
+                        "volume_compra": candle["volume_compra"], "volume_venda": candle["volume_venda"],
+                        "nota_tendencia": nota_tendencia, "status_tendencia": status_tendencia
+                    })
+        
+        # --- Lógica de VENDA (Alvo / Banda) ---
+        elif sair_banda_agora and posicao == "COMPRA":
+            # Se estiver no modo adaptativo de tendência, sair_banda_agora será False, então ele não entra aqui
+            # e só sai pelo Stop Móvel (Trailing).
+            
+            target_check = preco_alvo_dinamico if mover_alvo_com_preco else (candle["BB_up"] * (1 - margem))
+            
+            if preco >= target_check:
+                valor_bruto = quantidade_ativos * preco
+                custo_taxa = valor_bruto * taxa_multiplier
+                valor_liquido = valor_bruto - custo_taxa
+                
+                lucro_operacao = valor_liquido - (quantidade_ativos * preco_entrada)
+                saldo = valor_liquido
+                
+                posicao = None
+                acao = "VENDA"
+                
+                operacoes.append((timestamp, "VENDA", preco, lucro_operacao, saldo, nota_tendencia, status_tendencia))
+        
+                if arquivo_operacoes:
+                    logs_para_csv.append({
+                        "timestamp": timestamp, "acao": acao, "preco": preco, 
+                        "lucro": lucro_operacao, "saldo": saldo, 
+                        "volume_compra": candle["volume_compra"], "volume_venda": candle["volume_venda"],
+                        "nota_tendencia": nota_tendencia, "status_tendencia": status_tendencia
+                    })
+
+    # === Escrita do CSV ===
+    if arquivo_operacoes and logs_para_csv:
+        pasta = os.path.dirname(arquivo_operacoes)
+        if pasta and not os.path.exists(pasta):
+            os.makedirs(pasta, exist_ok=True)
+        df_logs = pd.DataFrame(logs_para_csv)
+        
+        colunas_ordem = ["timestamp", "acao", "preco", "lucro", "saldo", "nota_tendencia", "status_tendencia", "volume_compra", "volume_venda"]
+        
+        cols_existentes = [c for c in colunas_ordem if c in df_logs.columns]
+        df_logs = df_logs[cols_existentes]
+        
+        df_logs.to_csv(arquivo_operacoes, index=False, sep=";", encoding="utf-8-sig")
+
+    return df, operacoes
+
+==============================================================================
+NOME DO ARQUIVO: config.py
+==============================================================================
+
+from binance.client import Client
+import json
+import os
+import sqlite3
+
+# === Chaves da API Binance ===
+api_key = 'SUA_API_KEY'        # 🔐 Substitua pela sua chave real
+api_secret = 'SUA_API_SECRET'  # 🔐 Substitua pela sua chave real
+
+# === Caminho para o banco de dados SQLite (FIXO) ===
+# O banco fica na pasta específica solicitada, fora da raiz do app
+base_dir_db = r"C:\db_sqlite"
+if not os.path.exists(base_dir_db):
+    try:
+        os.makedirs(base_dir_db)
+    except OSError:
+        pass # Se não der para criar, vai tentar salvar onde der ou dar erro de SQLite depois
+
+db_name = "candles_data.db"
+db_path = os.path.join(base_dir_db, db_name)
+
+# === Mapeamento de intervalos da Binance ===
+interval_map = {
+    "1m": Client.KLINE_INTERVAL_1MINUTE,
+    "5m": Client.KLINE_INTERVAL_5MINUTE,
+    "30m": Client.KLINE_INTERVAL_30MINUTE,
+    "1h": Client.KLINE_INTERVAL_1HOUR,
+    "4h": Client.KLINE_INTERVAL_4HOUR,
+    "1d": Client.KLINE_INTERVAL_1DAY
+}
+
+# === Mapeamento de tabelas do banco de dados ===
+table_map = {
+    "1m": "candles_1m",
+    "5m": "candles_5m",
+    "30m": "candles_30m",
+    "1h": "candles_1h",
+    "4h": "candles_4h",
+    "1d": "candles_1d"
+}
+
+# === Configuração via JSON ===
+config_file = "app_config.json"
+
+def ler_config():
+    """Lê configuração do aplicativo via JSON."""
+    if os.path.exists(config_file):
+        try:
+            with open(config_file, "r", encoding="utf-8") as f:
+                config = json.load(f)
+        except Exception:
+            config = {}
+    else:
+        config = {}
+    return config
+
+
+def salvar_config(config: dict):
+    """Salva configuração geral em JSON."""
+    with open(config_file, "w", encoding="utf-8") as f:
+        json.dump(config, f, ensure_ascii=False, indent=4)
+
+
+# === Configuração de Estratégia (armazenada no SQLite) ===
+
+def inicializar_tabela_configuracoes(db_path):
+    """Garante que a tabela de configurações exista com valores padrão."""
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS configuracoes (
+            chave TEXT PRIMARY KEY,
+            valor REAL
+        )
+    """)
+    # Valores padrão
+    configs_iniciais = [
+        ('bollinger_distancia', 0.5),
+        ('stop_loss_perc', 2.0),
+        ('trading_fee_perc', 0.1)
+    ]
+    
+    cursor.executemany("""
+        INSERT OR IGNORE INTO configuracoes (chave, valor)
+        VALUES (?, ?)
+    """, configs_iniciais)
+    
+    conn.commit()
+    conn.close()
+
+
+def obter_bollinger_distancia(db_path):
+    inicializar_tabela_configuracoes(db_path)
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    cursor.execute("SELECT valor FROM configuracoes WHERE chave='bollinger_distancia'")
+    row = cursor.fetchone()
+    conn.close()
+    return float(row[0]) if row else 0.5
+
+
+def atualizar_bollinger_distancia(db_path, novo_valor: float):
+    inicializar_tabela_configuracoes(db_path)
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO configuracoes (chave, valor)
+        VALUES ('bollinger_distancia', ?)
+        ON CONFLICT(chave) DO UPDATE SET valor=excluded.valor
+    """, (novo_valor,))
+    conn.commit()
+    conn.close()
+
+
+def obter_stop_loss(db_path):
+    inicializar_tabela_configuracoes(db_path)
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    cursor.execute("SELECT valor FROM configuracoes WHERE chave='stop_loss_perc'")
+    row = cursor.fetchone()
+    conn.close()
+    return float(row[0]) if row else 2.0
+
+
+def atualizar_stop_loss(db_path, novo_valor: float):
+    inicializar_tabela_configuracoes(db_path)
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO configuracoes (chave, valor)
+        VALUES ('stop_loss_perc', ?)
+        ON CONFLICT(chave) DO UPDATE SET valor=excluded.valor
+    """, (novo_valor,))
+    conn.commit()
+    conn.close()
+
+
+def obter_taxa_corretagem(db_path):
+    inicializar_tabela_configuracoes(db_path)
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    cursor.execute("SELECT valor FROM configuracoes WHERE chave='trading_fee_perc'")
+    row = cursor.fetchone()
+    conn.close()
+    return float(row[0]) if row else 0.1
+
+
+def atualizar_taxa_corretagem(db_path, novo_valor: float):
+    inicializar_tabela_configuracoes(db_path)
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO configuracoes (chave, valor)
+        VALUES ('trading_fee_perc', ?)
+        ON CONFLICT(chave) DO UPDATE SET valor=excluded.valor
+    """, (novo_valor,))
+    conn.commit()
+    conn.close()
+
+==============================================================================
+NOME DO ARQUIVO: db_utils.py
+==============================================================================
+
+import sqlite3
+import pandas as pd
+from datetime import datetime
+from binance.client import Client
+from binance.exceptions import BinanceAPIException, BinanceRequestException
+import time
+from config import api_key, api_secret, interval_map
+
+
+def listar_pares_disponiveis(db_path):
+    """Lista pares de moedas existentes no banco SQLite."""
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    tabelas = [row[0] for row in cursor.fetchall()]
+
+    pares = sorted(set(
+        t.split("_")[1].upper()
+        for t in tabelas
+        if t.startswith("candles_") and len(t.split("_")) == 3
+    ))
+
+    conn.close()
+    return pares
+
+
+def listar_intervalos_disponiveis(db_path, simbolo):
+    """
+    Retorna os intervalos disponíveis para um par específico.
+    Ex: ['1h', '1d']
+    """
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    tabelas = [row[0] for row in cursor.fetchall()]
+    conn.close()
+
+    prefix = f"candles_{simbolo.lower()}_"
+    intervalos = sorted({t.split("_")[2] for t in tabelas if t.startswith(prefix)})
+    return intervalos
+
+
+def listar_pares_e_periodos(db_path):
+    """
+    Retorna um dicionário com pares e seus respectivos períodos disponíveis.
+    Ex: {'BTCUSDT': ['1h', '4h'], 'ETHUSDT': ['1h']}
+    """
+    pares = {}
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'candles_%'")
+        tabelas = cursor.fetchall()
+
+        for (tabela,) in tabelas:
+            partes = tabela.split("_")
+            if len(partes) == 3:
+                _, par, periodo = partes
+                par = par.upper()
+                if par not in pares:
+                    pares[par] = []
+                pares[par].append(periodo)
+        conn.close()
+    except Exception as e:
+        print(f"❌ Erro ao listar pares: {e}")
+
+    for par in pares:
+        pares[par] = sorted(pares[par], key=lambda x: (len(x), x))
+    return pares
+
+
+def selecionar_par_interativo(db_path):
+    """Permite o usuário escolher interativamente um par de moedas."""
+    pares = listar_pares_disponiveis(db_path)
+
+    if not pares:
+        print("⚠️ Nenhum par de moedas encontrado no banco.")
+        novo = input("Digite o símbolo de um novo par (ex: BTCUSDT): ").strip().upper()
+        return novo if novo else None
+
+    print("\n📊 Pares disponíveis no banco de dados:")
+    for i, par in enumerate(pares, start=1):
+        print(f"{i} - {par}")
+    print("0 - Digitar novo par manualmente")
+
+    while True:
+        escolha = input("\nEscolha o número do par ou digite o nome diretamente: ").strip()
+
+        if escolha == "0":
+            novo = input("Digite o novo par (ex: BTCUSDT): ").strip().upper()
+            return novo if novo else None
+        elif escolha.isdigit() and 1 <= int(escolha) <= len(pares):
+            return pares[int(escolha) - 1]
+        elif escolha.upper() in pares:
+            return escolha.upper()
+        else:
+            print("❌ Opção inválida. Tente novamente.")
+
+
+def banco_possui_tabelas_candles(db_path):
+    """Verifica se existem tabelas de candles no banco."""
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'candles_%'")
+    resultado = cursor.fetchall()
+    conn.close()
+    return len(resultado) > 0
+
+
+def importar_candles_binance(db_path, symbol, interval, start_str=None, limit=1000):
+    """
+    Função central para buscar candles da Binance e salvar no SQLite.
+    Se start_str for fornecido, busca a partir dessa data.
+    Se não, busca a partir do último registro no banco (ou os últimos 1000 se vazio).
+    """
+    client = Client(api_key, api_secret)
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    table_name = f"candles_{symbol.lower()}_{interval}"
+
+    # Criar a tabela se não existir (Schema unificado)
+    cursor.execute(f'''
+        CREATE TABLE IF NOT EXISTS {table_name} (
+            timestamp INTEGER PRIMARY KEY,
+            open REAL,
+            high REAL,
+            low REAL,
+            close REAL,
+            volume REAL,
+            close_time INTEGER,
+            quote_asset_volume REAL,
+            number_of_trades INTEGER,
+            taker_buy_base_asset_volume REAL,
+            taker_buy_quote_asset_volume REAL
+        )
+    ''')
+
+    # Determinar data de início se não informada
+    if not start_str:
+        cursor.execute(f"SELECT MAX(timestamp) FROM {table_name}")
+        max_ts = cursor.fetchone()[0]
+
+        if max_ts:
+            start_dt = datetime.fromtimestamp((max_ts + 1) / 1000)
+            start_str = start_dt.strftime('%Y-%m-%d %H:%M:%S')
+            print(f"🔄 Atualizando {symbol} ({interval}) a partir de {start_str}")
+        else:
+            print(f"⬇️ Baixando {limit} candles iniciais para {symbol} ({interval})...")
+            start_str = None  # Vai usar o limit do get_historical_klines
+
+    try:
+        if start_str:
+            candles = client.get_historical_klines(symbol, interval, start_str=start_str)
+        else:
+            candles = client.get_historical_klines(symbol, interval, limit=limit)
+    except (BinanceAPIException, BinanceRequestException) as e:
+        print(f"❌ Erro na API da Binance para {symbol}: {e}")
+        conn.close()
+        return 0
+
+    inserted = 0
+    for candle in candles:
+        try:
+            cursor.execute(f'''
+                INSERT INTO {table_name} (
+                    timestamp, open, high, low, close, volume,
+                    close_time, quote_asset_volume, number_of_trades,
+                    taker_buy_base_asset_volume, taker_buy_quote_asset_volume
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', candle[:11])
+            inserted += 1
+        except sqlite3.IntegrityError:
+            continue  # Ignorar duplicatas
+
+    conn.commit()
+    conn.close()
+    return inserted
+
+
+def atualizar_banco(db_path, symbol=None):
+    """
+    Atualiza TODOS os intervalos configurados para um par (ou seleciona um).
+    Realiza backup antes de atualizar.
+    """
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+
+    # === Selecionar símbolo interativamente, se não informado ===
+    if not symbol:
+        symbol = selecionar_par_interativo(db_path)
+        if not symbol:
+            print("❌ Nenhum par selecionado. Operação cancelada.")
+            conn.close()
+            return
+
+    conn.close() # Fechar aqui pois importar_candles abre sua própria conexão
+    symbols = [symbol.upper()]
+
+    for sym in symbols:
+        for interval_key, interval in interval_map.items():
+            table_name = f"candles_{sym.lower()}_{interval_key}"
+            
+            # --- Lógica de Backup (Corrigida) ---
+            conn = sqlite3.connect(db_path)
+            cursor = conn.cursor()
+            
+            # Verifica se a tabela existe de verdade antes de tentar contar ou fazer backup
+            cursor.execute(f"SELECT name FROM sqlite_master WHERE type='table' AND name='{table_name}'")
+            existe = cursor.fetchone()
+
+            if existe:
+                cursor.execute(f"SELECT COUNT(*) FROM {table_name}")
+                row_count = cursor.fetchone()[0]
+
+                if row_count > 0:
+                    timestamp_str = datetime.now().strftime('%Y%m%d_%H%M%S')
+                    backup_table = f"{table_name}_backup_{timestamp_str}"
+                    print(f"\n🗂️ Backup: {table_name} → {backup_table}")
+                    cursor.execute(f"CREATE TABLE {backup_table} AS SELECT * FROM {table_name}")
+                    conn.commit()
+            
+            conn.close()
+            # ------------------------------------------------
+
+            # Chama a função unificada de importação
+            # Ela criará a tabela completa se não existir
+            inseridos = importar_candles_binance(db_path, sym, interval)
+            
+            if inseridos > 0:
+                print(f"✅ {sym} ({interval}): {inseridos} novos candles.")
+            else:
+                print(f"ℹ️ {sym} ({interval}): Sem novos dados.")
+
+            time.sleep(1.2)  # Respeitar limite da Binance
+
+    print("\n✅ Atualização automática concluída.")
+
+
+def carregar_candles(db_path, simbolo, intervalo, data_inicial, data_final):
+    """
+    Carrega os candles da tabela correspondente ao par e intervalo.
+    Converte automaticamente timestamps numéricos (epoch ms) para datetime.
+    """
+    nome_tabela = f"candles_{simbolo.lower()}_{intervalo}"
+
+    try:
+        conn = sqlite3.connect(db_path)
+        query = f"""
+            SELECT timestamp, open, high, low, close, volume
+            FROM {nome_tabela}
+            ORDER BY timestamp ASC
+        """
+        df = pd.read_sql_query(query, conn)
+        conn.close()
+
+        if df.empty:
+            return df
+
+        # Detectar e converter epoch (em milissegundos) para datetime
+        if pd.api.types.is_numeric_dtype(df["timestamp"]):
+            df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", errors="coerce")
+        else:
+            df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+
+        # Filtrar pelo intervalo de datas informado
+        data_inicial_dt = pd.to_datetime(data_inicial)
+        data_final_dt = pd.to_datetime(data_final)
+        df = df[(df["timestamp"] >= data_inicial_dt) & (df["timestamp"] <= data_final_dt)]
+
+        return df
+
+    except Exception as e:
+        print(f"❌ Erro ao carregar dados da tabela {nome_tabela}: {e}")
+        return pd.DataFrame()
+
+==============================================================================
+NOME DO ARQUIVO: exportar_excel.py
+==============================================================================
+
+import sqlite3
+import pandas as pd
+import os
+import re
+
+def exportar_candles_para_excel(db_path):
+    os.system('cls' if os.name == 'nt' else 'clear')
+
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+
+    # Detectar tabelas do tipo candles_<symbol>_<interval>
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    tabelas = [row[0] for row in cursor.fetchall()]
+
+    padrao = re.compile(r'^candles_([a-z0-9]+)_([a-z0-9]+)$')
+    disponiveis = []
+
+    for nome in tabelas:
+        match = padrao.match(nome)
+        if match:
+            symbol, intervalo = match.groups()
+            disponiveis.append((symbol.upper(), intervalo))
+
+    if not disponiveis:
+        print("⚠️ Nenhuma tabela de candles encontrada no banco.")
+        conn.close()
+        return
+
+    # Filtrar opções únicas
+    symbols = sorted(set(s for s, _ in disponiveis))
+    intervalos = sorted(set(i for _, i in disponiveis))
+
+    if len(symbols) == 1:
+        symbol_escolhido = symbols[0]
+        print(f"💱 Par encontrado: {symbol_escolhido}")
+    else:
+        print("💱 Pares disponíveis:")
+        for s in symbols:
+            print(f" - {s}")
+        symbol_escolhido = input("Digite o par desejado (ex: BTCUSDT): ").strip().upper()
+        if symbol_escolhido not in symbols:
+            print("❌ Par inválido.")
+            conn.close()
+            return
+
+    if len(intervalos) == 1:
+        intervalo_escolhido = intervalos[0]
+        print(f"⏱️ Intervalo encontrado: {intervalo_escolhido}")
+    else:
+        print("⏱️ Intervalos disponíveis:")
+        for i in intervalos:
+            print(f" - {i}")
+        intervalo_escolhido = input("Digite o intervalo desejado (ex: 1m, 5m): ").strip().lower()
+        if intervalo_escolhido not in intervalos:
+            print("❌ Intervalo inválido.")
+            conn.close()
+            return
+
+    nome_tabela = f"candles_{symbol_escolhido.lower()}_{intervalo_escolhido}"
+
+    try:
+        query = f"""
+            SELECT timestamp, open, high, low, close, volume
+            FROM {nome_tabela}
+            ORDER BY timestamp DESC
+            LIMIT 100
+        """
+        df = pd.read_sql_query(query, conn)
+    except Exception as e:
+        print(f"❌ Erro ao consultar a tabela: {e}")
+        conn.close()
+        return
+
+    conn.close()
+
+    if df.empty:
+        print("⚠️ Nenhum dado encontrado para exportação.")
+        return
+
+    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+    df = df.sort_values('timestamp')
+
+    excel_filename = f"{nome_tabela}_candles.xlsx"
+    writer = pd.ExcelWriter(excel_filename, engine='xlsxwriter')
+    df.to_excel(writer, sheet_name='Candles', index=False)
+
+    workbook = writer.book
+    worksheet = writer.sheets['Candles']
+
+    # Gráfico de candles
+    chart = workbook.add_chart({'type': 'stock'})
+    chart.add_series({
+        'name': 'Candles',
+        'categories': ['Candles', 1, 0, len(df), 0],
+        'values': ['Candles', 1, 4, len(df), 4],
+        'open': ['Candles', 1, 1, len(df), 1],
+        'high': ['Candles', 1, 2, len(df), 2],
+        'low': ['Candles', 1, 3, len(df), 3],
+        'close': ['Candles', 1, 4, len(df), 4],
+    })
+
+    chart.set_title({'name': f'Candles – {symbol_escolhido} ({intervalo_escolhido})'})
+    chart.set_x_axis({'name': 'Tempo'})
+    chart.set_y_axis({'name': 'Preço'})
+    chart.set_size({'width': 800, 'height': 400})
+
+    worksheet.insert_chart('H2', chart)
+
+    # Novo gráfico de volume
+    chart_vol = workbook.add_chart({'type': 'column'})
+    chart_vol.add_series({
+        'name': 'Volume',
+        'categories': ['Candles', 1, 0, len(df), 0],
+        'values': ['Candles', 1, 5, len(df), 5],
+    })
+    chart_vol.set_title({'name': 'Volume por Candle'})
+    chart_vol.set_x_axis({'name': 'Tempo'})
+    chart_vol.set_y_axis({'name': 'Volume'})
+    chart_vol.set_size({'width': 800, 'height': 300})
+    worksheet.insert_chart('H25', chart_vol)
+
+    writer.close()
+
+    full_path = os.path.abspath(excel_filename)
+    print(f"✅ Dados exportados para '{excel_filename}' com gráficos de candles e volume incluídos.")
+    print(f"📁 Caminho completo: {full_path}")
+
+    if os.name == 'nt':
+        os.startfile(full_path)
+
+
+==============================================================================
+NOME DO ARQUIVO: exportar_json.py
+==============================================================================
+
+import os
+import sqlite3
+import json
+import pandas as pd
+from datetime import datetime, timedelta
+from db_utils import banco_possui_tabelas_candles, listar_pares_e_periodos
+
+# === Exporta candles para JSON (.txt) ===
+def exportar_candles_para_json_txt(db_path, par=None, periodo=None, data_inicio=None, data_fim=None):
+    try:
+        conn = sqlite3.connect(db_path)
+
+        cursor = conn.cursor()
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'candles_%'")
+        tabelas = [row[0] for row in cursor.fetchall()]
+
+        if not tabelas:
+            print("⚠️ Nenhuma tabela de candles encontrada no banco.")
+            return
+
+        if par:
+            tabelas = [t for t in tabelas if f"candles_{par.lower()}_" in t]
+
+        if periodo:
+            tabelas = [t for t in tabelas if t.endswith(f"_{periodo}")]
+
+        if not tabelas:
+            print("⚠️ Nenhuma tabela correspondente aos filtros foi encontrada.")
+            return
+
+        # Salva na raiz do projeto (Diretório Atual de Trabalho)
+        dir_saida = os.getcwd() 
+        # os.makedirs(dir_saida, exist_ok=True) -> Não precisa pois raiz já existe
+
+        for tabela in tabelas:
+            partes = tabela.split("_")
+            if len(partes) != 3:
+                continue
+
+            _, par_tabela, periodo_tabela = partes
+            par_tabela = par_tabela.upper()
+
+            print(f"\n📤 Exportando {par_tabela} ({periodo_tabela})...")
+
+            query = f"SELECT * FROM {tabela}"
+            params = []
+
+            timestamp_inicio = None
+            timestamp_fim = None
+            if data_inicio:
+                dt_inicio = datetime.strptime(data_inicio, "%Y-%m-%d")
+                timestamp_inicio = int(dt_inicio.timestamp() * 1000)
+            if data_fim:
+                dt_fim = datetime.strptime(data_fim, "%Y-%m-%d") + timedelta(hours=23, minutes=59, seconds=59)
+                timestamp_fim = int(dt_fim.timestamp() * 1000)
+
+            if timestamp_inicio and timestamp_fim:
+                query += " WHERE timestamp BETWEEN ? AND ?"
+                params = [timestamp_inicio, timestamp_fim]
+            elif timestamp_inicio:
+                query += " WHERE timestamp >= ?"
+                params = [timestamp_inicio]
+            elif timestamp_fim:
+                query += " WHERE timestamp <= ?"
+                params = [timestamp_fim]
+
+            df = pd.read_sql_query(query, conn, params=params)
+
+            if df.empty:
+                print(f"⚠️ Nenhum registro encontrado para {par_tabela} ({periodo_tabela}) no intervalo informado.")
+                continue
+
+            # Adiciona coluna legível
+            df["datetime"] = pd.to_datetime(df["timestamp"], unit="ms")
+
+            # === Converte todos os Timestamps para string antes de exportar ===
+            df_to_export = df.copy()
+            for col in df_to_export.columns:
+                if pd.api.types.is_datetime64_any_dtype(df_to_export[col]):
+                    df_to_export[col] = df_to_export[col].dt.strftime("%Y-%m-%d %H:%M:%S")
+
+            nome_arquivo = f"{par_tabela}_{periodo_tabela}.txt"
+            caminho_arquivo = os.path.join(dir_saida, nome_arquivo)
+
+            with open(caminho_arquivo, "w", encoding="utf-8") as f:
+                json.dump(df_to_export.to_dict(orient="records"), f, indent=4, ensure_ascii=False)
+
+            print(f"✅ Arquivo exportado com sucesso: {caminho_arquivo}")
+
+        conn.close()
+
+    except Exception as e:
+        print(f"❌ Erro durante exportação: {e}")
+
+==============================================================================
+NOME DO ARQUIVO: graficos.py
+==============================================================================
+
+import os
+import plotly.graph_objects as go
+
+def gerar_grafico_csv(df, simbolo, intervalo, data_inicial, data_final):
+    # Salva na raiz
+    pasta_saida = "." 
+    
+    nome_base = f"{simbolo}_{intervalo}_{data_inicial.strftime('%Y%m%d')}_{data_final.strftime('%Y%m%d')}"
+    caminho_csv = os.path.join(pasta_saida, nome_base + ".csv")
+    df.to_csv(caminho_csv, index=False, encoding="utf-8-sig")
+
+    print(f"\n💾 CSV salvo em: {caminho_csv}")
+
+    fig = go.Figure()
+
+    # Candlestick
+    fig.add_trace(go.Candlestick(
+        x=df['timestamp'],
+        open=df['open'],
+        high=df['high'],
+        low=df['low'],
+        close=df['close'],
+        name='Candles'
+    ))
+
+    # Bandas de Bollinger
+    if 'BB_up' in df.columns and 'BB_down' in df.columns:
+        fig.add_trace(go.Scatter(
+            x=df['timestamp'],
+            y=df['BB_up'],
+            name='Banda Superior',
+            line=dict(color='rgba(0,255,0,0.5)', width=1)
+        ))
+        fig.add_trace(go.Scatter(
+            x=df['timestamp'],
+            y=df['BB_down'],
+            name='Banda Inferior',
+            line=dict(color='rgba(255,0,0,0.5)', width=1),
+            fill='tonexty',
+            fillcolor='rgba(200,200,200,0.1)'
+        ))
+
+    # Média
+    if 'media' in df.columns:
+        fig.add_trace(go.Scatter(
+            x=df['timestamp'],
+            y=df['media'],
+            name='Média (20)',
+            line=dict(color='rgba(255,255,255,0.3)', width=1)
+        ))
+
+    # Volume de compra e venda
+    if 'volume_compra' in df.columns and 'volume_venda' in df.columns:
+        fig.add_trace(go.Bar(
+            x=df['timestamp'],
+            y=df['volume_compra'],
+            name='Volume Compra',
+            marker_color='green',
+            yaxis='y2',
+            opacity=0.5
+        ))
+        fig.add_trace(go.Bar(
+            x=df['timestamp'],
+            y=df['volume_venda'],
+            name='Volume Venda',
+            marker_color='red',
+            yaxis='y2',
+            opacity=0.5
+        ))
+
+    # Layout com eixo secundário
+    fig.update_layout(
+        title=f'{simbolo.upper()} - {intervalo} ({data_inicial:%d/%m/%Y} → {data_final:%d/%m/%Y})',
+        xaxis_title='Timestamp',
+        yaxis_title='Preço',
+        yaxis2=dict(title='Volume', overlaying='y', side='right', showgrid=False),
+        template='plotly_dark',
+        hovermode='x unified',
+        width=1200,
+        height=700
+    )
+
+    # Salvar HTML na raiz
+    caminho_html = os.path.join(pasta_saida, nome_base + ".html")
+    fig.write_html(caminho_html)
+    print(f"🌐 Gráfico salvo em HTML: {caminho_html}")
+
+    fig.show()
+
+==============================================================================
+NOME DO ARQUIVO: indicadores.py
+==============================================================================
+
+import pandas as pd
+import numpy as np
+
+def calcular_bollinger(df, periodo=20, num_desvios=2):
+    """
+    Calcula as Bandas de Bollinger e a Media Movel (SMA).
+
+    Parametros:
+        df: DataFrame com colunas 'close' para preco de fechamento.
+        periodo: Periodo da Media Movel Simples (SMA). Padrao 20.
+        num_desvios: Numero de desvios padrao para as bandas. Padrao 2.
+
+    Retorna:
+        DataFrame com colunas adicionais 'media', 'desvio', 'BB_up' e 'BB_down'.
+    """
+    # 1. Calcular a Media Movel Simples (SMA)
+    df['media'] = df['close'].rolling(window=periodo).mean()
+
+    # 2. Calcular o Desvio Padrao
+    df['desvio'] = df['close'].rolling(window=periodo).std()
+
+    # 3. Calcular Bandas de Bollinger
+    df['BB_up'] = df['media'] + (df['desvio'] * num_desvios)
+    df['BB_down'] = df['media'] - (df['desvio'] * num_desvios)
+
+    return df
+
+def adicionar_ema_tendencia(df, periodo_ema):
+    """
+    Calcula a Media Movel Exponencial (EMA) para filtro de tendencia.
+    """
+    col_name = f'ema_{periodo_ema}'
+    df[col_name] = df['close'].ewm(span=periodo_ema, adjust=False).mean()
+    return df
+
+def calcular_rsi(df, periodo=14):
+    """
+    Calcula o RSI (Indice de Forca Relativa) padrao de 14 periodos.
+    O RSI varia de 0 a 100 e sera usado como 'Nota' da tendencia.
+    """
+    delta = df['close'].diff()
+
+    # Separa ganhos e perdas
+    up = delta.clip(lower=0)
+    down = -1 * delta.clip(upper=0)
+
+    # Media Movel Exponencial (Wilder's Smoothing)
+    ewm_up = up.ewm(com=periodo - 1, adjust=False).mean()
+    ewm_down = down.ewm(com=periodo - 1, adjust=False).mean()
+
+    # Calculo do RS
+    rs = ewm_up / ewm_down
+
+    # Calculo do RSI (0 a 100)
+    df['rsi'] = 100 - (100 / (1 + rs))
+    
+    # Preencher NaN iniciais com 50 (neutro) para nao quebrar logica
+    df['rsi'] = df['rsi'].fillna(50)
+    
+    return df
+
+def avaliar_tendencia_nota(df):
+    """
+    Atribui uma nota e um status ao mercado baseado no RSI.
+    
+    Classificacao solicitada:
+    - 01 a 20: Franca Queda
+    - 21 a 40: Queda
+    - 41 a 60: Lateralizando
+    - 61 a 80: Subida
+    - 81 a 99: Franca Subida
+    """
+    # Define a nota como o valor arredondado do RSI
+    df['nota_tendencia'] = df['rsi'].round(2)
+
+    # Logica de classificacao vetorial (numpy select para performance)
+    condicoes = [
+        (df['nota_tendencia'] <= 20),
+        (df['nota_tendencia'] > 20) & (df['nota_tendencia'] <= 40),
+        (df['nota_tendencia'] > 40) & (df['nota_tendencia'] <= 60),
+        (df['nota_tendencia'] > 60) & (df['nota_tendencia'] <= 80),
+        (df['nota_tendencia'] > 80)
+    ]
+
+    escolhas = [
+        "Franca Queda",
+        "Queda",
+        "Lateralizando",
+        "Subida",
+        "Franca Subida"
+    ]
+
+    df['status_tendencia'] = np.select(condicoes, escolhas, default="Indefinido")
+    
+    return df
+
+def enriquecer_dados_analise(df):
+    """
+    Calcula indicadores adicionais para analise (ex: separacao de volume e nota de tendencia).
+    Usa operacoes vetorizadas (numpy) para alta performance.
+    """
+    # Evita Warning de SettingWithCopy
+    df = df.copy()
+
+    # Separacao de volume baseada na cor do candle (Close > Open = Compra)
+    # np.where eh muito mais rapido que apply
+    df['volume_compra'] = np.where(df['close'] > df['open'], df['volume'], 0)
+    df['volume_venda'] = np.where(df['close'] < df['open'], df['volume'], 0)
+    
+    # === NOVOS CALCULOS DE NOTA DE MERCADO ===
+    df = calcular_rsi(df)
+    df = avaliar_tendencia_nota(df)
+    
+    return df
+
+==============================================================================
+NOME DO ARQUIVO: limpeza_backup.py
+==============================================================================
+
+# limpeza_backup.py
+
+import sqlite3
+
+def listar_e_apagar_backups(db_path):
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+
+    # Buscar nomes de todas as tabelas
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    tabelas = [row[0] for row in cursor.fetchall()]
+
+    # Filtrar as que são de backup
+    tabelas_backup = [t for t in tabelas if "_backup_" in t]
+
+    if not tabelas_backup:
+        print("ℹ️ Nenhuma tabela de backup encontrada.")
+        conn.close()
+        return
+
+    print("\n📦 Tabelas de backup encontradas:")
+    for t in tabelas_backup:
+        print(f" - {t}")
+
+    confirmacao = input("⚠️ Deseja apagar todas essas tabelas de backup? (s/n): ").lower()
+    if confirmacao != 's':
+        print("❌ Operação cancelada.")
+        conn.close()
+        return
+
+    # Deletar tabelas de backup
+    for t in tabelas_backup:
+        try:
+            cursor.execute(f"DROP TABLE IF EXISTS {t}")
+            print(f"🧹 Tabela '{t}' removida com sucesso.")
+        except Exception as e:
+            print(f"❌ Erro ao remover '{t}': {e}")
+
+    conn.commit()
+    conn.close()
+    print("✅ Limpeza concluída.")
+
+
+==============================================================================
+NOME DO ARQUIVO: main.py
+==============================================================================
+
+import warnings
+import os
+import sys
+from datetime import datetime, timedelta
+
+# Suprimir avisos desnecessários
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+
+# Importações locais
+from config import db_path, ler_config, salvar_config
+from analise import executar_analise
+from limpeza_backup import listar_e_apagar_backups
+from exportar_excel import exportar_candles_para_excel
+from atualizar_candles import alimentar_sqlite_com_candles
+from db_utils import atualizar_banco, banco_possui_tabelas_candles, listar_pares_disponiveis
+from exportar_json import exportar_candles_para_json_txt, listar_pares_e_periodos
+
+# === Limpar Tela ===
+def limpar_tela():
+    os.system('cls' if os.name == 'nt' else 'clear')
+
+# === Entrada Segura com "R" para retorno ===
+def entrada_segura(prompt):
+    valor = input(prompt).strip()
+    if valor.lower() == "r":
+        raise SystemExit("MENU")
+    return valor
+
+# === Configurar Aplicativo ===
+def configurar_aplicativo():
+    print("\n⚙️ Configuração do Aplicativo")
+    config = ler_config()
+    caminho_atual = config.get("pasta_exports", "exports")
+    print(f"📂 Caminho atual para exports: {caminho_atual}")
+    novo_caminho = entrada_segura("Digite o novo caminho para salvar os exports: ").strip()
+    if novo_caminho:
+        config["pasta_exports"] = novo_caminho
+        salvar_config(config)
+        print(f"✅ Caminho atualizado para: {novo_caminho}")
+    else:
+        print("⚠️ Caminho não alterado.")
+
+# === Menu Principal ===
+def mostrar_menu():
+    while True:
+        try:
+            limpar_tela()
+            print("\n📋 MENU PRINCIPAL")
+            print("1 - Análise Técnica (Suporte, Resistência e Backtest EMA9 x EMA21)")
+            print("2 - Limpar Tabelas de Backup")
+            print("3 - Exportar Candles para Excel com Gráfico")
+            print("4 - Importar Candles Históricos (Binance → SQLite)")
+            print("5 - Exportar Dados para JSON (.txt)")
+            print("6 - Adicionar Novo Par de Moedas")
+            print("7 - Configurar Aplicativo (caminho de exports)")
+            print("0 - Sair")
+
+            escolha = entrada_segura("\nEscolha uma opção: ")
+
+            # === 1 - Análise Técnica ===
+            if escolha == "1":
+                limpar_tela()
+                try:
+                    executar_analise(db_path)
+                except SystemExit as e:
+                    if str(e) == "MENU":
+                        continue
+                    else:
+                        raise
+                entrada_segura("\nPressione Enter para voltar ao menu...")
+
+            # === 2 - Limpeza de Backups ===
+            elif escolha == "2":
+                limpar_tela()
+                listar_e_apagar_backups(db_path)
+                entrada_segura("\nPressione Enter para voltar ao menu...")
+
+            # === 3 - Exportar para Excel ===
+            elif escolha == "3":
+                limpar_tela()
+                exportar_candles_para_excel(db_path)
+                entrada_segura("\nPressione Enter para voltar ao menu...")
+
+            # === 4 - Importar Candles Históricos ===
+            elif escolha == "4":
+                limpar_tela()
+                alimentar_sqlite_com_candles(db_path)
+                entrada_segura("\nPressione Enter para voltar ao menu...")
+
+            # === 5 - Exportar para JSON (.txt) ===
+            elif escolha == "5":
+                limpar_tela()
+                pares = listar_pares_e_periodos(db_path)
+
+                if not pares:
+                    print("⚠️ Nenhuma tabela de candles encontrada para exportação.")
+                    entrada_segura("\nPressione Enter para voltar ao menu...")
+                    continue
+
+                # Seleção de par
+                print("📊 Pares disponíveis:\n")
+                pares_lista = list(pares.keys())
+                for i, par in enumerate(pares_lista, start=1):
+                    print(f"{i} - {par}")
+                print("0 - Exportar TODOS os pares / Voltar ao menu")
+                escolha_par = entrada_segura("\nEscolha o par: ")
+                if escolha_par == "0":
+                    exportar_candles_para_json_txt(db_path)
+                    entrada_segura("\nPressione Enter para voltar ao menu...")
+                    continue
+                elif escolha_par.isdigit() and 1 <= int(escolha_par) <= len(pares_lista):
+                    par_escolhido = pares_lista[int(escolha_par) - 1]
+                else:
+                    print("❌ Opção inválida.")
+                    entrada_segura("\nPressione Enter para voltar ao menu...")
+                    continue
+
+                # Seleção de período
+                periodos = pares[par_escolhido]
+                print(f"\n⏱ Períodos disponíveis para {par_escolhido}:\n")
+                for i, periodo in enumerate(periodos, start=1):
+                    print(f"{i} - {periodo}")
+                print("0 - Exportar TODOS os períodos / Voltar ao menu")
+                escolha_periodo = entrada_segura("\nEscolha o período: ")
+                if escolha_periodo == "0":
+                    exportar_candles_para_json_txt(db_path, par=par_escolhido)
+                    entrada_segura("\nPressione Enter para voltar ao menu...")
+                    continue
+                elif escolha_periodo.isdigit() and 1 <= int(escolha_periodo) <= len(periodos):
+                    periodo_escolhido = periodos[int(escolha_periodo) - 1]
+                else:
+                    print("❌ Opção inválida.")
+                    entrada_segura("\nPressione Enter para voltar ao menu...")
+                    continue
+
+                # Datas
+                print(f"\n📅 Defina o intervalo de datas para exportação ({par_escolhido.upper()} - {periodo_escolhido})")
+                data_inicio = entrada_segura("Data inicial (YYYY-MM-DD HH:MM:SS) [Enter para mínimo disponível]: ") or None
+                data_fim = entrada_segura("Data final (YYYY-MM-DD HH:MM:SS) [Enter para máximo disponível]: ") or None
+
+                exportar_candles_para_json_txt(
+                    db_path,
+                    par=par_escolhido,
+                    periodo=periodo_escolhido,
+                    data_inicio=data_inicio,
+                    data_fim=data_fim
+                )
+                entrada_segura("\nPressione Enter para voltar ao menu...")
+
+            # === 6 - Adicionar novo par ===
+            elif escolha == "6":
+                limpar_tela()
+                novo_par = entrada_segura("Digite o novo par (ex: ADAUSDT) ou 0 para voltar: ").upper()
+                if novo_par == "0":
+                    continue
+                if novo_par:
+                    print(f"📡 Criando tabelas para {novo_par}...")
+                    atualizar_banco(db_path, novo_par)
+                else:
+                    print("❌ Par inválido.")
+                entrada_segura("\nPressione Enter para voltar ao menu...")
+
+            # === 7 - Configurar Aplicativo ===
+            elif escolha == "7":
+                limpar_tela()
+                configurar_aplicativo()
+                entrada_segura("\nPressione Enter para voltar ao menu...")
+
+            # === 0 - Sair ===
+            elif escolha == "0":
+                limpar_tela()
+                print("👋 Encerrando o programa. Até mais!")
+                break
+
+            else:
+                print("❌ Opção inválida. Pressione Enter para tentar novamente.")
+                entrada_segura("")
+
+        except SystemExit as e:
+            if str(e) == "MENU":
+                continue
+            else:
+                raise
+
+# === Execução Inicial ===
+def main():
+    try:
+        limpar_tela()
+        print("🚀 Iniciando sistema...")
+
+        if banco_possui_tabelas_candles(db_path):
+            print("✅ Tabelas de candles encontradas.")
+            print("📡 Atualizando automaticamente todas as tabelas de candles para todos os pares...")
+            # Atualiza todas as tabelas de todos os pares
+            pares = listar_pares_disponiveis(db_path)
+            for par in pares:
+                atualizar_banco(db_path, par)
+        else:
+            print("⚠️ Nenhuma tabela de candles encontrada.")
+            simbolo = input("Digite o par de moedas inicial (ex: BTCUSDT): ").upper()
+            if simbolo:
+                atualizar_banco(db_path, simbolo)
+            else:
+                print("❌ Nenhum par informado. O programa iniciará sem dados.")
+
+        entrada_segura("\nPressione Enter para continuar...")
+        limpar_tela()
+        mostrar_menu()
+
+    except SystemExit as e:
+        if str(e) == "MENU":
+            limpar_tela()
+            mostrar_menu()
+        else:
+            raise
+
+if __name__ == "__main__":
+    main()
+
+
+==============================================================================
+NOME DO ARQUIVO: old_banco_dados.py
+==============================================================================
+
+import sqlite3
+import pandas as pd
+
+# === Carregar candles do banco ===
+def carregar_candles(db_path, simbolo, intervalo, data_inicial, data_final):
+    """
+    Carrega os candles da tabela correspondente ao par e intervalo.
+    Converte automaticamente timestamps numéricos (epoch ms) para datetime.
+    """
+    nome_tabela = f"candles_{simbolo.lower()}_{intervalo}"
+
+    try:
+        conn = sqlite3.connect(db_path)
+        query = f"""
+            SELECT timestamp, open, high, low, close, volume
+            FROM {nome_tabela}
+            ORDER BY timestamp ASC
+        """
+        df = pd.read_sql_query(query, conn)
+        conn.close()
+
+        if df.empty:
+            return df
+
+        # Detectar e converter epoch (em milissegundos) para datetime
+        if pd.api.types.is_numeric_dtype(df["timestamp"]):
+            df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", errors="coerce")
+        else:
+            df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+
+        # Filtrar pelo intervalo de datas informado
+        data_inicial_dt = pd.to_datetime(data_inicial)
+        data_final_dt = pd.to_datetime(data_final)
+        df = df[(df["timestamp"] >= data_inicial_dt) & (df["timestamp"] <= data_final_dt)]
+
+        return df
+
+    except Exception as e:
+        print(f"❌ Erro ao carregar dados da tabela {nome_tabela}: {e}")
+        return pd.DataFrame()
+
+==============================================================================
+NOME DO ARQUIVO: old_gerar_fluxograma.py
+==============================================================================
+
+from pptx import Presentation
+from pptx.util import Inches, Pt
+from pptx.enum.shapes import MSO_SHAPE, MSO_CONNECTOR
+from pptx.dml.color import RGBColor
+
+# === Criar apresentação ===
+prs = Presentation()
+slide = prs.slides.add_slide(prs.slide_layouts[5])  # Layout em branco
+
+# === Função para adicionar retângulos de ação ===
+def adicionar_acao(slide, left, top, width, height, texto):
+    shape = slide.shapes.add_shape(
+        MSO_SHAPE.RECTANGLE,
+        Inches(left),
+        Inches(top),
+        Inches(width),
+        Inches(height)
+    )
+    shape.fill.solid()
+    shape.fill.fore_color.rgb = RGBColor(173, 216, 230)  # Azul claro
+    shape.line.color.rgb = RGBColor(0, 0, 0)
+    shape.text = texto
+    shape.text_frame.paragraphs[0].font.size = Pt(12)
+    return shape
+
+# === Função para adicionar losango de decisão ===
+def adicionar_decisao(slide, left, top, width, height, texto):
+    shape = slide.shapes.add_shape(
+        MSO_SHAPE.DIAMOND,
+        Inches(left),
+        Inches(top),
+        Inches(width),
+        Inches(height)
+    )
+    shape.fill.solid()
+    shape.fill.fore_color.rgb = RGBColor(255, 255, 153)  # Amarelo claro
+    shape.line.color.rgb = RGBColor(0, 0, 0)
+    shape.text = texto
+    shape.text_frame.paragraphs[0].font.size = Pt(12)
+    return shape
+
+# === Função para conectar dois shapes com seta ===
+def conectar(shapes_slide, shape_from, shape_to):
+    connector = slide.shapes.add_connector(
+        MSO_CONNECTOR.STRAIGHT,
+        shape_from.left + shape_from.width/2,
+        shape_from.top + shape_from.height,
+        shape_to.left + shape_to.width/2,
+        shape_to.top
+    )
+    connector.line.color.rgb = RGBColor(0, 0, 0)
+    return connector
+
+# === Definir posições ===
+top = 0.5
+left = 1
+width = 2
+height = 0.8
+espaco = 1.2
+
+# === Adicionar caixas de ação e decisão ===
+menu = adicionar_acao(slide, left, top, width, height, "Menu Principal\nEscolher ação")
+top += espaco
+
+atualizar = adicionar_acao(slide, left, top, width, height, "Atualizar Tabelas\n(Banco Binance → SQLite)")
+limpar_backups = adicionar_acao(slide, left + 3, top, width, height, "Limpar Tabelas de Backup")
+top += espaco
+
+analise = adicionar_acao(slide, left, top, width, height, "Análise Técnica\n(Escolher par e intervalo, Backtest)")
+exportar_excel = adicionar_acao(slide, left + 3, top, width, height, "Exportar Excel")
+top += espaco
+
+adicionar_par = adicionar_acao(slide, left, top, width, height, "Adicionar Novo Par de Moedas")
+config = adicionar_acao(slide, left + 3, top, width, height, "Configurar Aplicativo\n(Caminho de Exports)")
+top += espaco
+
+sair = adicionar_acao(slide, left + 1.5, top, width, height, "Sair")
+
+# === Conectar shapes ===
+conectar(slide, menu, atualizar)
+conectar(slide, menu, limpar_backups)
+conectar(slide, menu, analise)
+conectar(slide, menu, exportar_excel)
+conectar(slide, menu, adicionar_par)
+conectar(slide, menu, config)
+conectar(slide, menu, sair)
+
+# === Salvar apresentação ===
+prs.save("Fluxograma_Aplicacao.pptx")
+print("✅ Fluxograma gerado: Fluxograma_Aplicacao.pptx")
+
+
+==============================================================================
+NOME DO ARQUIVO: relatorio_ia.py
+==============================================================================
+
+import pandas as pd
+
+def gerar_relatorio_performance(operacoes, saldo_inicial, simbolo, intervalo):
+    """
+    Gera um relatório estatístico textual formatado para análise de IA.
+    Calcula Win Rate, Profit Factor, Drawdown e lista operações compactadas.
+    """
+    if not operacoes:
+        return "⚠️ Nenhuma operação realizada no período."
+
+    # Converter lista de tuplas em DataFrame (Agora com 7 colunas)
+    df_ops = pd.DataFrame(operacoes, columns=["timestamp", "tipo", "preco", "lucro", "saldo", "nota", "status"])
+    
+    # Filtrar apenas as linhas de saída (onde o lucro/prejuízo é realizado)
+    df_saidas = df_ops[df_ops['tipo'].isin(['VENDA', 'STOP LOSS', 'TRAILING STOP'])].copy()
+    
+    if df_saidas.empty:
+        return "⚠️ Nenhuma operação fechada (apenas compras em aberto ou sem trades)."
+
+    # === Cálculos Estatísticos ===
+    qtd_trades = len(df_saidas)
+    qtd_vitorias = len(df_saidas[df_saidas['lucro'] > 0])
+    qtd_derrotas = len(df_saidas[df_saidas['lucro'] <= 0])
+    win_rate = (qtd_vitorias / qtd_trades) * 100
+
+    lucro_bruto = df_saidas[df_saidas['lucro'] > 0]['lucro'].sum()
+    prejuizo_bruto = abs(df_saidas[df_saidas['lucro'] <= 0]['lucro'].sum())
+    
+    # Profit Factor (evita divisão por zero)
+    profit_factor = lucro_bruto / prejuizo_bruto if prejuizo_bruto > 0 else float('inf')
+
+    saldo_final = df_saidas.iloc[-1]['saldo']
+    resultado_total = saldo_final - saldo_inicial
+    resultado_perc = (resultado_total / saldo_inicial) * 100
+
+    # === Cálculo de Drawdown Máximo ===
+    # O Drawdown é calculado sobre o histórico de saldo trade a trade
+    saldos = df_ops['saldo'].values
+    pico = saldos[0]
+    max_drawdown_perc = 0.0
+
+    peak = saldo_inicial
+    for s in saldos:
+        if s > peak:
+            peak = s
+        dd = (peak - s) / peak
+        if dd > max_drawdown_perc:
+            max_drawdown_perc = dd
+            
+    max_drawdown_perc *= 100  # Converter para %
+
+    # === Formatação do Relatório ===
+    relatorio = []
+    relatorio.append(f"📊 RELATÓRIO DE PERFORMANCE: {simbolo} ({intervalo})")
+    relatorio.append("=" * 40)
+    relatorio.append(f"💰 Saldo Inicial:   $ {saldo_inicial:.2f}")
+    relatorio.append(f"💰 Saldo Final:     $ {saldo_final:.2f}")
+    relatorio.append(f"📈 Lucro Líquido:   $ {resultado_total:.2f} ({resultado_perc:+.2f}%)")
+    relatorio.append("-" * 40)
+    relatorio.append(f"🎲 Total Trades:     {qtd_trades}")
+    relatorio.append(f"✅ Acertos (Wins):   {qtd_vitorias} ({win_rate:.1f}%)")
+    relatorio.append(f"❌ Erros (Losses):   {qtd_derrotas}")
+    relatorio.append(f"⚖️ Profit Factor:    {profit_factor:.2f}")
+    relatorio.append(f"📉 Max Drawdown:     {max_drawdown_perc:.2f}%")
+    relatorio.append("=" * 40)
+    
+    # === Mini Log de Operações (CSV Compacto para Análise) ===
+    relatorio.append("\n📋 LOG DE OPERAÇÕES (Copie para análise):")
+    relatorio.append("timestamp;tipo;preco;lucro;saldo;nota;status")
+    
+    for _, row in df_ops.iterrows():
+        # Formata timestamp para ficar curto
+        ts_str = row['timestamp'].strftime('%Y-%m-%d %H:%M')
+        tipo = row['tipo']
+        preco = f"{row['preco']:.5f}" # 5 casas decimais para cripto
+        lucro = f"{row['lucro']:.2f}"
+        saldo_op = f"{row['saldo']:.2f}"
+        nota = f"{row['nota']:.0f}"
+        status = row['status']
+        
+        relatorio.append(f"{ts_str};{tipo};{preco};{lucro};{saldo_op};{nota};{status}")
+
+    return "\n".join(relatorio)

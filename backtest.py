@@ -51,7 +51,7 @@ def backtest_bollinger(df, distancia_bollinger=0.5, stop_loss_perc=None, taxa_co
         # === DEFINIÇÃO DINÂMICA DE COMPORTAMENTO ===
         if estrategia_adaptativa:
             # 1. Filtro de Segurança (Hard Floor)
-            # Se adaptativo, nunca compra abaixo de 20 (Franca Queda) - AJUSTADO PARA 20
+            # Se adaptativo, nunca compra abaixo de 20 (Franca Queda)
             filtro_adaptativo_ok = (nota_tendencia >= 20)
             
             # 2. Definição de Saída baseada na força atual
@@ -61,7 +61,7 @@ def backtest_bollinger(df, distancia_bollinger=0.5, stop_loss_perc=None, taxa_co
                 sair_banda_agora = False # Ignora o teto da banda para deixar subir
                 modo_log = "TREND"
             else:
-                # Mercado Lateral ou Fraco: Garante o lucro na banda
+                # Mercado Lateral ou Fraco: Garante o lucro na banda (ou média)
                 usar_trailing_agora = False
                 sair_banda_agora = True
                 modo_log = "SCALP"
@@ -88,7 +88,7 @@ def backtest_bollinger(df, distancia_bollinger=0.5, stop_loss_perc=None, taxa_co
                 if preco > maximo_atingido:
                     diferenca = preco - maximo_atingido
                     preco_alvo_dinamico += diferenca 
-                    maximo_atingido = preco           
+                    maximo_atingido = preco            
 
         # --- VERIFICAÇÃO DE SAÍDA PELO STOP ---
         if posicao == "COMPRA" and stop_loss_perc:
@@ -125,13 +125,24 @@ def backtest_bollinger(df, distancia_bollinger=0.5, stop_loss_perc=None, taxa_co
             
             if nota_tendencia < nota_minima:
                 tendencia_ok = False
+            
+            # Regra Universal: Ignorar compras se RSI (Nota) for menor que 20
+            if nota_tendencia < 20:
+                tendencia_ok = False
                 
             # Filtro Adaptativo
             if estrategia_adaptativa and not filtro_adaptativo_ok:
                 tendencia_ok = False
             
-            # Cálculos de Potencial
-            alvo_estimado = candle["BB_up"] * (1 - margem)
+            # === CÁLCULO DE POTENCIAL DE LUCRO ===
+            # Se Adaptativo e Nota <= 40 (Queda/Fraqueza), o alvo é a MÉDIA, não a Banda Superior
+            if estrategia_adaptativa and nota_tendencia <= 40:
+                 alvo_referencia = candle["media"]
+            else:
+                 alvo_referencia = candle["BB_up"]
+
+            alvo_estimado = alvo_referencia * (1 - margem)
+            
             lucro_bruto_potencial_valor = alvo_estimado - preco
             custo_total_est = (preco * taxa_multiplier) + (alvo_estimado * taxa_multiplier)
             margem_lucro_exigida = preco * (lucro_minimo_perc / 100.0)
@@ -165,10 +176,20 @@ def backtest_bollinger(df, distancia_bollinger=0.5, stop_loss_perc=None, taxa_co
         
         # --- Lógica de VENDA (Alvo / Banda) ---
         elif sair_banda_agora and posicao == "COMPRA":
-            # Se estiver no modo adaptativo de tendência, sair_banda_agora será False, então ele não entra aqui
-            # e só sai pelo Stop Móvel (Trailing).
+            # Se estiver no modo adaptativo de tendência (Nota > 60), sair_banda_agora será False
+            # Se estiver no modo adaptativo fraco (Nota <= 60), ele entra aqui.
             
-            target_check = preco_alvo_dinamico if mover_alvo_com_preco else (candle["BB_up"] * (1 - margem))
+            # [NOVO] Se a nota atual indica fraqueza (<= 40), sai na MÉDIA.
+            # Se a nota melhorou (> 40), sai na BANDA SUPERIOR.
+            if estrategia_adaptativa and nota_tendencia <= 40:
+                alvo_referencia_saida = candle["media"]
+            else:
+                alvo_referencia_saida = candle["BB_up"]
+            
+            if mover_alvo_com_preco:
+                target_check = preco_alvo_dinamico
+            else:
+                target_check = alvo_referencia_saida * (1 - margem)
             
             if preco >= target_check:
                 valor_bruto = quantidade_ativos * preco

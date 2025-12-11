@@ -145,29 +145,30 @@ def executar_analise(caminho_db):
             except:
                 print("❌ Valor inválido. Usando 0.0%.")
         
+        # --- FILTRO DE NOTA (Universal) ---
+        nota_minima = 0
+        resp_nota = input("Definir NOTA MÍNIMA de Tendência (0-100) para entrar (Ex: 40 para evitar Quedas Fortes): ").strip()
+        if resp_nota.isdigit():
+            nota_minima = int(resp_nota)
+            print(f"🛡️ Filtro de Qualidade Ativo: Só compra se Nota >= {nota_minima}")
+        
         # --- ESTRATÉGIA ADAPTATIVA (RSI) ---
         print("\n🤖 [NOVO] Estratégia Adaptativa (RSI)")
-        print("Se ativada, o robô decide automaticamente:")
-        print(" - Nota < 20: Não entra (Hard Floor).")
-        print(" - Nota 20 a 60: Sai na Banda Superior (Scalp).")
-        print(" - Nota > 60: Ativa Trailing Stop e ignora Banda Superior (Surf).")
+        print("Se ativada, o robô decide automaticamente a SAÍDA:")
+        print(" - Nota 20-40: Sai na Média Central (Defensivo).")
+        print(" - Nota 40-60: Sai na Banda Superior (Padrão).")
+        print(" - Nota > 60: Ativa Trailing Stop e ignora teto (Surf).")
         
-        usar_adaptativo = input("Ativar Estratégia Adaptativa? [S/N]: ").strip().upper() == "S"
+        usar_adaptativo = input("Ativar Logica Adaptativa de SAÍDA? [S/N]: ").strip().upper() == "S"
         
-        nota_minima = 0
         usar_trailing = False
         mover_alvo = False
         sair_banda = True
         
         if usar_adaptativo:
-            print("✅ Estratégia Adaptativa ATIVADA. Parâmetros de saída serão automáticos.")
+            print("✅ Estratégia Adaptativa ATIVADA. Modos de saída serão automáticos.")
         else:
-            # Configuração Manual Antiga
-            resp_nota = input("Definir NOTA MÍNIMA de Tendência (0-100) para entrar (Ex: 30 para evitar Quedas): ").strip()
-            if resp_nota.isdigit():
-                nota_minima = int(resp_nota)
-                print(f"🛡️ Filtro de Qualidade Ativo: Só compra se Nota >= {nota_minima}")
-            
+            # Configuração Manual Antiga (Só pergunta se NÃO for adaptativo)
             usar_trailing = input("Usa Trailing Stop (Stop Móvel)? [S/N]: ").strip().upper() == "S"
             
             if usar_trailing:
@@ -242,8 +243,16 @@ def executar_analise(caminho_db):
             print("⚠️ Nenhum dado encontrado para o período.")
             return
 
-        # === Salva na RAIZ (.) ===
-        arquivo_csv_operacoes = f"operacoes_{simbolo}_{intervalo}.csv"
+        # === DEFINIÇÃO DO CAMINHO DE SAÍDA ===
+        caminho_saida = r"C:\Users\danilombsantos\Documents\GitHub\myProject\outputs"
+        if not os.path.exists(caminho_saida):
+            try:
+                os.makedirs(caminho_saida)
+            except OSError as e:
+                print(f"⚠️ Não foi possível criar o diretório {caminho_saida}. Salvando no atual.")
+                caminho_saida = "."
+
+        arquivo_csv_operacoes = os.path.join(caminho_saida, f"operacoes_{simbolo}_{intervalo}.csv")
         saldo_inicial = 1000.0
 
         # === Backtest Bollinger com registro em CSV ===
@@ -295,10 +304,10 @@ def executar_analise(caminho_db):
             log_completo += f"   - Taxa Corretagem: {taxa_corretagem}%\n"
             log_completo += f"   - Filtro EMA: {'DESATIVADO' if not periodo_ema else f'ATIVO (Período {periodo_ema})'}\n"
             log_completo += f"   - Lucro Mínimo Exigido: {lucro_minimo}%\n"
+            log_completo += f"   - Nota Mínima (Filtro Entrada): {nota_minima}\n"
             log_completo += f"   - Estratégia Adaptativa (RSI): {'ATIVADA' if usar_adaptativo else 'OFF'}\n"
             
             if not usar_adaptativo:
-                log_completo += f"   - Nota Mínima (RSI): {nota_minima}\n"
                 tipo_desc = "ALVO FIXO (Padrão)"
                 if not sair_banda: tipo_desc = "TREND FOLLOWING (Sem Alvo)"
                 elif mover_alvo: tipo_desc = "ALVO MÓVEL (Persegue Preço)"
@@ -340,8 +349,8 @@ def executar_analise(caminho_db):
             print(log_completo)
 
             try:
-                diretorio_atual = os.getcwd()
-                caminho_log_geral = os.path.join(diretorio_atual, "outputTestes.log")
+                # Caminho fixo para o LOG geral também
+                caminho_log_geral = os.path.join(caminho_saida, "outputTestes.log")
                 print(f"📂 Tentando salvar log geral em: {caminho_log_geral}")
                 with open(caminho_log_geral, "a", encoding="utf-8") as f:
                     f.write(log_completo + "\n")

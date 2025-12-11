@@ -9,11 +9,12 @@ warnings.filterwarnings("ignore", category=DeprecationWarning)
 # Importações locais
 from config import db_path, ler_config, salvar_config
 from analise import executar_analise
-from limpeza_backup import listar_e_apagar_backups
+# limpeza_backup foi removido pois a rotatividade é automática agora
 from exportar_excel import exportar_candles_para_excel
 from atualizar_candles import alimentar_sqlite_com_candles
 from db_utils import atualizar_banco, banco_possui_tabelas_candles, listar_pares_disponiveis
 from exportar_json import exportar_candles_para_json_txt, listar_pares_e_periodos
+from otimizador import executar_otimizacao
 
 # === Limpar Tela ===
 def limpar_tela():
@@ -46,13 +47,13 @@ def mostrar_menu():
         try:
             limpar_tela()
             print("\n📋 MENU PRINCIPAL")
-            print("1 - Análise Técnica (Suporte, Resistência e Backtest EMA9 x EMA21)")
-            print("2 - Limpar Tabelas de Backup")
-            print("3 - Exportar Candles para Excel com Gráfico")
-            print("4 - Importar Candles Históricos (Binance → SQLite)")
-            print("5 - Exportar Dados para JSON (.txt)")
-            print("6 - Adicionar Novo Par de Moedas")
-            print("7 - Configurar Aplicativo (caminho de exports)")
+            print("1 - Análise Técnica (Suporte, Resistência e Backtest)")
+            print("2 - Exportar Candles para Excel com Gráfico")
+            print("3 - Importar Candles Históricos (Binance → SQLite)")
+            print("4 - Exportar Dados para JSON (.txt)")
+            print("5 - Adicionar Novo Par de Moedas")
+            print("6 - Configurar Aplicativo (caminho de exports)")
+            print("7 - Otimizador de Estratégia (Grid Search)")
             print("0 - Sair")
 
             escolha = entrada_segura("\nEscolha uma opção: ")
@@ -69,26 +70,20 @@ def mostrar_menu():
                         raise
                 entrada_segura("\nPressione Enter para voltar ao menu...")
 
-            # === 2 - Limpeza de Backups ===
+            # === 2 - Exportar para Excel ===
             elif escolha == "2":
-                limpar_tela()
-                listar_e_apagar_backups(db_path)
-                entrada_segura("\nPressione Enter para voltar ao menu...")
-
-            # === 3 - Exportar para Excel ===
-            elif escolha == "3":
                 limpar_tela()
                 exportar_candles_para_excel(db_path)
                 entrada_segura("\nPressione Enter para voltar ao menu...")
 
-            # === 4 - Importar Candles Históricos ===
-            elif escolha == "4":
+            # === 3 - Importar Candles Históricos ===
+            elif escolha == "3":
                 limpar_tela()
                 alimentar_sqlite_com_candles(db_path)
                 entrada_segura("\nPressione Enter para voltar ao menu...")
 
-            # === 5 - Exportar para JSON (.txt) ===
-            elif escolha == "5":
+            # === 4 - Exportar para JSON (.txt) ===
+            elif escolha == "4":
                 limpar_tela()
                 pares = listar_pares_e_periodos(db_path)
 
@@ -147,8 +142,8 @@ def mostrar_menu():
                 )
                 entrada_segura("\nPressione Enter para voltar ao menu...")
 
-            # === 6 - Adicionar novo par ===
-            elif escolha == "6":
+            # === 5 - Adicionar novo par ===
+            elif escolha == "5":
                 limpar_tela()
                 novo_par = entrada_segura("Digite o novo par (ex: ADAUSDT) ou 0 para voltar: ").upper()
                 if novo_par == "0":
@@ -160,11 +155,22 @@ def mostrar_menu():
                     print("❌ Par inválido.")
                 entrada_segura("\nPressione Enter para voltar ao menu...")
 
-            # === 7 - Configurar Aplicativo ===
-            elif escolha == "7":
+            # === 6 - Configurar Aplicativo ===
+            elif escolha == "6":
                 limpar_tela()
                 configurar_aplicativo()
                 entrada_segura("\nPressione Enter para voltar ao menu...")
+
+            # === 7 - OTIMIZADOR (GRID SEARCH) ===
+            elif escolha == "7":
+                limpar_tela()
+                try:
+                    executar_otimizacao(db_path)
+                except SystemExit as e:
+                    if str(e) == "MENU":
+                        continue
+                    else:
+                        raise
 
             # === 0 - Sair ===
             elif escolha == "0":
@@ -178,7 +184,8 @@ def mostrar_menu():
 
         except SystemExit as e:
             if str(e) == "MENU":
-                continue
+                limpar_tela()
+                mostrar_menu()
             else:
                 raise
 

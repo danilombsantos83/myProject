@@ -2,8 +2,13 @@
 import plotly.graph_objects as go
 
 def gerar_grafico_csv(df, simbolo, intervalo, data_inicial, data_final):
-    # Salva na raiz
-    pasta_saida = "." 
+    # === DEFINIÇÃO DO CAMINHO DE SAÍDA ===
+    pasta_saida = r"C:\Users\danilombsantos\Documents\GitHub\myProject\outputs"
+    if not os.path.exists(pasta_saida):
+        try:
+            os.makedirs(pasta_saida)
+        except OSError:
+            pasta_saida = "." # Fallback para raiz se der erro de permissão
     
     nome_base = f"{simbolo}_{intervalo}_{data_inicial.strftime('%Y%m%d')}_{data_final.strftime('%Y%m%d')}"
     caminho_csv = os.path.join(pasta_saida, nome_base + ".csv")
@@ -80,7 +85,7 @@ def gerar_grafico_csv(df, simbolo, intervalo, data_inicial, data_final):
         height=700
     )
 
-    # Salvar HTML na raiz
+    # Salvar HTML no caminho especificado
     caminho_html = os.path.join(pasta_saida, nome_base + ".html")
     fig.write_html(caminho_html)
     print(f"🌐 Gráfico salvo em HTML: {caminho_html}")
